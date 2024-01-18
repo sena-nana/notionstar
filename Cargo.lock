@@ -719,6 +719,7 @@ dependencies = [
  "indicatif",
  "notion",
  "octocrab",
+ "reqwest",
  "tokio",
 ]
 

@@ -1,12 +1,13 @@
 use dotenv::dotenv;
 use indicatif::ProgressBar;
 use notion::{
+    chrono::NaiveDate,
     ids::PropertyId,
     models::{
         paging::{Pageable, PagingCursor},
         properties::{DateOrDateTime, DateValue, PropertyValue},
         text::{Annotations, RichText, RichTextCommon, Text},
-        DateTime, Page, PageCreateRequest, Parent, Properties, Utc,
+        Page, PageCreateRequest, Parent, Properties,
     },
     NotionApi,
 };
@@ -15,9 +16,11 @@ use octocrab::{
     models::{repos::Release, Repository},
 };
 use reqwest;
+use serde_json;
 use std::{collections::HashMap, str::FromStr};
 use std::{collections::HashSet, env};
 use tokio;
+
 #[tokio::main]
 async fn main() {
     dotenv().ok();
@@ -60,6 +63,92 @@ async fn main() {
     );
 
     notion.archive_repo(delete_stars).await;
+
+    let new_database = notion.get_database().await;
+    println!("updating database");
+    let pb = ProgressBar::new(stars.len() as u64);
+    println!("Starting add repo");
+    pb.set_style(
+        indicatif::ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
+            .unwrap(),
+    );
+
+    for page in new_database {
+        let name = page.title().unwrap();
+        pb.set_message("updating ".to_string() + &name);
+        let repo = star_map.get(&name).unwrap();
+        let lastupdate = match notion
+            .get_release(&repo.to_owned().owner.unwrap().login, &name)
+            .await
+        {
+            Ok(release) => Some(release.published_at.unwrap().naive_utc().date()),
+            Err(_) => None,
+        };
+        let notion_last_update = match page.properties.properties.get("上次release").unwrap() {
+            PropertyValue::Date { id: _, date } => match date {
+                Some(date) => match date.start {
+                    DateOrDateTime::Date(date) => Some(date),
+                    _ => None,
+                },
+                None => None,
+            },
+            _ => None,
+        };
+        let release_date = if lastupdate != notion_last_update {
+            lastupdate
+        } else {
+            None
+        };
+        let commit = match notion
+            .github
+            .repos(repo.to_owned().owner.unwrap().login, &name)
+            .list_commits()
+            .send()
+            .await
+        {
+            Ok(commits) => match commits.items.first() {
+                Some(commit) => match commit.commit.committer.to_owned().unwrap().date {
+                    Some(date) => Some(date.naive_utc().date()),
+                    None => None,
+                },
+                None => None,
+            },
+            Err(_) => None,
+        };
+        let notion_commit = match page.properties.properties.get("上次commit") {
+            Some(date) => match date {
+                PropertyValue::Date { id: _, date } => match date {
+                    Some(date) => match date.start {
+                        DateOrDateTime::Date(date) => Some(date),
+                        _ => None,
+                    },
+                    None => None,
+                },
+                _ => None,
+            },
+            None => None,
+        };
+        let commit_date = if commit != notion_commit {
+            commit
+        } else {
+            None
+        };
+        if release_date.is_none() && commit_date.is_none() {
+            pb.inc(1);
+            continue;
+        } else {
+            println!(
+                "\nrelease: {:?}->{:?}, commit: {:?}->{:?}\n",
+                notion_last_update, release_date, notion_commit, commit_date
+            );
+        }
+        notion
+            .update_date(&page.id.to_string(), &release_date, &commit_date)
+            .await;
+        pb.inc(1);
+    }
+    pb.finish_and_clear();
 }
 
 struct Notion {
@@ -124,13 +213,12 @@ impl Notion {
                 .await
                 .unwrap();
             results.extend(database.results);
+            println!("database count {}", results.len());
             if database.next_cursor.is_none() {
                 break;
             } else {
                 next_cursor = database.next_cursor
             }
-
-            println!("database count {}", results.len());
         }
 
         return results;
@@ -139,28 +227,16 @@ impl Notion {
     async fn _add_repo(&self, stars: Repository) -> Page {
         let owner = stars.owner.unwrap().login;
         let name = stars.name;
-        let release = self.get_release(&owner, &name).await;
-        let lastupdate = match release {
-            Ok(release) => Some(release.published_at.unwrap()),
-            Err(_) => None,
-        };
         return self
             .new_data(
                 name.to_owned(),
                 stars.html_url.unwrap().to_string(),
                 owner.to_owned(),
-                lastupdate,
             )
             .await;
     }
 
-    async fn new_data(
-        &self,
-        name: String,
-        release: String,
-        owner: String,
-        lastupdate: Option<DateTime<Utc>>,
-    ) -> Page {
+    async fn new_data(&self, name: String, release: String, owner: String) -> Page {
         let properties = Properties {
             properties: HashMap::from([
                 (
@@ -175,20 +251,6 @@ impl Notion {
                     PropertyValue::Url {
                         id: PropertyId::from_str("pr%7Cj").unwrap(),
                         url: Some(release),
-                    },
-                ),
-                (
-                    "上次release".to_owned(),
-                    PropertyValue::Date {
-                        id: PropertyId::from_str("pvki").unwrap(),
-                        date: match lastupdate {
-                            Some(_) => Some(DateValue {
-                                start: DateOrDateTime::Date(lastupdate.unwrap().date_naive()),
-                                end: None,
-                                time_zone: None,
-                            }),
-                            None => None,
-                        },
                     },
                 ),
                 (
@@ -242,7 +304,7 @@ impl Notion {
         let session = reqwest::Client::new();
         for star in stars {
             pb.set_message("archive ".to_string() + &star.title().unwrap());
-            session
+            let resp = session
                 .patch("https://api.notion.com/v1/pages/".to_owned() + &star.id.to_string())
                 .header("Authorization", format!("Bearer {}", self.token))
                 .header("Notion-Version", "2022-06-28")
@@ -250,9 +312,61 @@ impl Notion {
                 .send()
                 .await
                 .unwrap();
+            if !resp.status().is_success() {
+                println!("{}", resp.text().await.unwrap());
+            }
             pb.inc(1);
         }
         pb.finish_and_clear()
+    }
+    async fn update_date(
+        &self,
+        page_id: &String,
+        release: &Option<NaiveDate>,
+        commit: &Option<NaiveDate>,
+    ) {
+        let session = reqwest::Client::new();
+        let mut body = HashMap::new();
+        if release.is_some() {
+            body.insert(
+                "上次release",
+                PropertyValue::Date {
+                    id: PropertyId::from_str("pkvi").unwrap(),
+                    date: Some(DateValue {
+                        start: DateOrDateTime::Date(release.unwrap()),
+                        end: None,
+                        time_zone: None,
+                    }),
+                },
+            );
+        }
+        if commit.is_some() {
+            body.insert(
+                "上次Commit",
+                PropertyValue::Date {
+                    id: PropertyId::from_str("%7B%3Ddw").unwrap(),
+                    date: Some(DateValue {
+                        start: DateOrDateTime::Date(commit.unwrap()),
+                        end: None,
+                        time_zone: None,
+                    }),
+                },
+            );
+        }
+        if body.is_empty() {
+            return;
+        }
+        let resp = session
+            .patch("https://api.notion.com/v1/pages/".to_owned() + page_id)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Notion-Version", "2022-06-28")
+            .json(&serde_json::json!({ "properties": body }))
+            .send()
+            .await
+            .unwrap();
+        if !resp.status().is_success() {
+            println!("{}", resp.text().await.unwrap());
+        }
     }
 }
 
